@@ -170,6 +170,13 @@ class WifiMacQueueContainer
     const ContainerQueue& GetQueue(const WifiContainerQueueId& queueId) const;
 
     /**
+     * Get a const reference to the entire internal queue map.
+     *
+     * \return a const reference to the unordered_map of all container queues
+     */
+    const std::unordered_map<WifiContainerQueueId, ContainerQueue>& GetQueues() const;
+
+    /**
      * Get the total size of the MPDUs stored in the queue identified by the given QueueId.
      *
      * \param queueId the given queue ID
