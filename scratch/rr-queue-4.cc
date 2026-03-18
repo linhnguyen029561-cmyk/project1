@@ -28,7 +28,6 @@
 #include "ns3/netanim-module.h"
 #include "ns3/traffic-control-module.h"
 #include "ns3/rr-queue-disc.h"
-#include "ns3/pcrq-queue-disc.h" // Thêm thư viện PcrqQueueDisc mới
 #include "ns3/wifi-mac-queue.h"
 #include "ns3/wifi-net-device.h"
 #include "ns3/wifi-mac.h"
@@ -49,16 +48,16 @@ NS_LOG_COMPONENT_DEFINE("WifiSimpleAdhocGrid");
 // --- Global state for periodic queue-length sampling ---
 static uint64_t g_qlenSamples = 0;      // sum of qlen samples
 static uint32_t g_qlenSampleCount = 0;  // number of samples taken
-static QueueDiscContainer* g_qdiscs = nullptr; // pointer set before Simulator::Run
+static std::vector<Ptr<WifiMacQueue>> g_macQueues; // list of MAC queues to sample
 
 void SampleQueueLength () {
-    if (!g_qdiscs) return;
     uint64_t total = 0;
-    for (uint32_t i = 0; i < g_qdiscs->GetN(); ++i)
-        total += g_qdiscs->Get(i)->GetNPackets();
+    for (auto& q : g_macQueues) {
+        if (q) total += q->GetNPackets();
+    }
     g_qlenSamples += total;
     g_qlenSampleCount++;
-    Simulator::Schedule(Seconds(0.5), &SampleQueueLength);
+    Simulator::Schedule(MilliSeconds(100), &SampleQueueLength); // Sample every 100ms
 }
 int main(int argc, char* argv[])
 {
@@ -109,10 +108,12 @@ int main(int argc, char* argv[])
     	// Configure WiFi
     	Config::SetDefault("ns3::WifiRemoteStationManager::RtsCtsThreshold", StringValue("0"));
    	 
-    	// --- QUEUE CONFIGURATION ---
-    	// Trả lại cấu hình MAC mặc định của NS-3
-    	// Mọi thuật toán Drop/Hold giờ sẽ chạ
-		// ưy trên Traffic Control (PcrqQueueDisc)
+    	// --- QUEUE CONFIGURATION (MAC layer PCRQ - từ bài báo) ---
+    	Config::SetDefault("ns3::WifiMacQueue::EnablePcrq", BooleanValue(true));
+    	Config::SetDefault("ns3::WifiMacQueue::Alpha", DoubleValue(2.0));   // α = 2.0
+    	Config::SetDefault("ns3::WifiMacQueue::Beta",  DoubleValue(0.3));   // β = 0.3
+    	Config::SetDefault("ns3::WifiMacQueue::Gamma", DoubleValue(0.3));   // γ = 0.3
+    	Config::SetDefault("ns3::WifiMacQueue::Delta", TimeValue(MilliSeconds(1))); // Δ = 1ms
     	// --- END QUEUE CONFIGURATION ---
  
     	WifiHelper wifi;
@@ -149,21 +150,28 @@ int main(int argc, char* argv[])
         Config::SetDefault("ns3::WifiMacQueue::MaxSize", QueueSizeValue(QueueSize("100p")));
 
         NetDeviceContainer devices = wifi.Install(wifiPhy, wifiMac, c);
-        
         // 1. Ép tầng MAC chạy ở chế độ cạnh tranh công bằng nhất (DCF style)
-	for (uint32_t i = 0; i < devices.GetN(); ++i) {
-    		Ptr<WifiNetDevice> wifiDev = DynamicCast<WifiNetDevice>(devices.Get(i));
-    		Ptr<WifiMac> mac = wifiDev->GetMac();
-    		PointerValue ptr;
+        for (uint32_t i = 0; i < devices.GetN(); ++i) {
+            Ptr<WifiNetDevice> wifiDev = DynamicCast<WifiNetDevice>(devices.Get(i));
+            Ptr<WifiMac> mac = wifiDev->GetMac();
     
-		for (int ac = 0; ac < 4; ac++) {
-        		mac->GetQosTxop(AcIndex(ac))->SetAifsn(3);
-        		mac->GetQosTxop(AcIndex(ac))->SetTxopLimit(MicroSeconds(0));
-        		mac->GetQosTxop(AcIndex(ac))->SetMinCw(15);
-        		mac->GetQosTxop(AcIndex(ac))->SetMaxCw(1023);
-    		
-		}
-	}
+            for (int ac = 0; ac < 4; ac++) {
+                mac->GetQosTxop(AcIndex(ac))->SetAifsn(3);
+                mac->GetQosTxop(AcIndex(ac))->SetTxopLimit(MicroSeconds(0));
+                mac->GetQosTxop(AcIndex(ac))->SetMinCw(15);
+                mac->GetQosTxop(AcIndex(ac))->SetMaxCw(1023);
+            }
+        }
+
+        // Collect all WifiMacQueues for sampling
+        g_macQueues.clear();
+        for (uint32_t i = 0; i < devices.GetN(); ++i) {
+            Ptr<WifiNetDevice> wifiDev = DynamicCast<WifiNetDevice>(devices.Get(i));
+            Ptr<WifiMac> mac = wifiDev->GetMac();
+            for (int ac = 0; ac < 4; ac++) {
+                g_macQueues.push_back(mac->GetQosTxop(AcIndex(ac))->GetWifiMacQueue());
+            }
+        }
 
 
         	// Set up mobility
@@ -182,18 +190,9 @@ int main(int argc, char* argv[])
     	internet.SetRoutingHelper(aodv);
     	internet.Install(c);
    	 
-    	TrafficControlHelper tch;
-    	// Thay vì dùng WifiMacQueue ở tầng MAC, ta cài đặt PcrqQueueDisc ở tầng Traffic Control (IP)
-    	uint16_t handle = tch.SetRootQueueDisc("ns3::PcrqQueueDisc",
-                 	"Alpha", DoubleValue(2.0),
-                 	"Beta", DoubleValue(0.3),
-                 	"Gamma", DoubleValue(0.3),
-                 	"Delta", TimeValue(MilliSeconds(1)),
-                 	"Timeout", UintegerValue(10),
-                 	"MaxSize", QueueSizeValue(QueueSize("100p")));
-					
-        //tch.AddPacketFilter(handle, "ns3::Ipv4PacketFilter");
-    	QueueDiscContainer qdiscs = tch.Install(devices);
+    	// Không cần TrafficControlHelper - PCRQ đang chạy trực tiếp trong WifiMacQueue (MAC layer)
+    	// Tạo QueueDiscContainer giả để tương thích với phần in qlen bên dưới
+    	QueueDiscContainer qdiscs;
  
     	// Assign IP addresses
     	Ipv4AddressHelper ipv4;
@@ -259,6 +258,10 @@ int main(int argc, char* argv[])
 
     	// Run simulation
     	Simulator::Stop(Seconds(22.0));
+    	// Reset và kích hoạt periodic queue-length sampling
+    	g_qlenSamples = 0;
+    	g_qlenSampleCount = 0;
+    	Simulator::Schedule(Seconds(0.5), &SampleQueueLength);
     	Simulator::Run();
  
     	// Collect and output results to CSV
@@ -271,17 +274,13 @@ int main(int argc, char* argv[])
         	double duration = iter->second.timeLastRxPacket.GetSeconds() - iter->second.timeFirstRxPacket.GetSeconds();
         	float throughput = (duration > 0) ? (iter->second.rxBytes * 8.0 / duration / 1e6) : 0.0;
         	
-        	// Tính queue length tổng từ QueueDisc
-        	uint32_t totalQueueLen = 0;
-        	for (uint32_t qd = 0; qd < qdiscs.GetN(); ++qd) {
-            		totalQueueLen += qdiscs.Get(qd)->GetNPackets();
-        	}
+        	// Average queue length dựa trên sampling định kỳ mỗi 0.5s
+        	double avgQueueLen = (g_qlenSampleCount > 0) ? (double)g_qlenSamples / g_qlenSampleCount : 0.0;
         	
-        	// Tính mean delay (ms) từ FlowMonitor
-        	double meanDelay_ms = 0.0;
-        	if (iter->second.rxPackets > 0) {
-            		meanDelay_ms = iter->second.delaySum.GetMilliSeconds() / iter->second.rxPackets;
-        	}
+        	// Mean delay (ms) từ FlowMonitor
+        	double meanDelay_ms = (iter->second.rxPackets > 0)
+            		? iter->second.delaySum.GetMilliSeconds() / iter->second.rxPackets
+            		: 0.0;
        	 
         	outFile << n_packets << ","
                 	<< iter->first << ","
@@ -296,7 +295,7 @@ int main(int argc, char* argv[])
                 	<< duration << ","
                 	<< throughput << ","
                 	<< singleFlowRateMbps << ","
-                	<< totalQueueLen << ","
+                	<< avgQueueLen << ","
                 	<< meanDelay_ms << "\n";
     	}
  
@@ -309,7 +308,6 @@ int main(int argc, char* argv[])
 	pcrqLog.close();
 	return 0;
 }
-
 
 
 
